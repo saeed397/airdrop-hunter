@@ -1,0 +1,48 @@
+# Core HTTP & Parsing
+httpx==0.27.2
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.3.0
+feedparser==6.0.11
+
+# Blockchain (READ-ONLY only)
+web3==7.4.0
+
+# Domain & Security helpers
+python-whois==0.9.4
+tldextract==5.1.2
+
+# Database
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+
+# Scheduler
+apscheduler==3.10.4
+
+# Telegram
+python-telegram-bot==21.6
+
+# Config & Validation
+python-dotenv==1.0.1
+pydantic==2.9.2
+pydantic-settings==2.6.1
+
+# Reliability
+tenacity==9.0.0
+loguru==0.7.2
+
+# Dashboard (Step 4)
+streamlit==1.39.0
+pandas==2.2.3
+plotly==5.24.1
+
+# Testing
+pytest==8.3.3
+pytest-asyncio==0.24.0
+
+# Utils
+python-dateutil==2.9.0.post0
+
+# Web server for health endpoint + scheduler host (Step 2)
+fastapi==0.115.4
+uvicorn==0.32.0

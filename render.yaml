@@ -1,0 +1,38 @@
+# Render Blueprint – one-click deploy style
+# Docs: https://render.com/docs/blueprint-spec
+#
+# Usage:
+#   1. Push this repo to GitHub
+#   2. In Render Dashboard → New → Blueprint → select the repo
+#   3. Fill env vars (especially DATABASE_URL)
+#   4. Deploy
+
+services:
+  - type: web
+    name: airdrop-hunter
+    runtime: docker
+    plan: free
+    region: frankfurt          # closest free region for Middle East / Europe
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: SCAN_INTERVAL_MINUTES
+        value: "30"
+      - key: ALERT_SCORE_THRESHOLD
+        value: "60"
+      # Secrets – set these in Render Dashboard (do NOT put real values here)
+      - key: DATABASE_URL
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: ETHERSCAN_API_KEY
+        sync: false
+      - key: GOPLUS_API_KEY
+        sync: false
