@@ -1,0 +1,6 @@
+streamlit1.39.0
+pandas2.2.3
+plotly5.24.1
+sqlalchemy2.0.36
+psycopg2-binary2.9.10
+python-dotenv1.0.1
