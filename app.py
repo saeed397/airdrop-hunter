@@ -1,0 +1,593 @@
+"""داشبورد ایردراپ — فارسی، فیلتر سخت‌گیرانه، توضیح تصمیم‌گیری"""
+import os
+import json
+from datetime import datetime
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+from sqlalchemy import create_engine, text
+
+st.set_page_config(
+    page_title="شکارچی ایردراپ",
+    page_icon="🎯",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# RTL برای متن فارسی
+st.markdown(
+    """
+    <style>
+    .block-container, .stMarkdown, .stCaption, .stExpander, label {
+        direction: rtl;
+        text-align: right;
+    }
+    [data-testid="stSidebar"] {
+        direction: rtl;
+        text-align: right;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+HELP = {
+    "score": (
+        "نمره مشروعیت (۰ تا ۱۰۰)\n\n"
+        "بالای ۵۵ یعنی نسبتاً قابل‌بررسی است.\n"
+        "بالای ۷۰ معمولاً بهتر است.\n"
+        "زیر ۵۵ را فعلاً جدی نگیرید مگر خودتان تحقیق کنید."
+    ),
+    "strategy": (
+        "نوع مشارکت\n\n"
+        "• بدون تراکنش: فالو، دیسکورد، امتیاز — مناسب‌تر برای شما\n"
+        "• کم‌تراکنش: کار سبک با هزینه کم\n"
+        "• عادی: ممکن است سواپ یا کار متوسط بخواهد\n"
+        "• همه روش‌ها: احتمال بریج، نقدینگی یا هزینه بیشتر\n\n"
+        "اگر تراکنش نمی‌زنید، فقط «بدون تراکنش» را روشن بگذارید."
+    ),
+    "status": (
+        "وضعیت در سیستم\n\n"
+        "• جدید: تازه پیدا شده\n"
+        "• اطلاع‌داده: به تلگرام رفته\n"
+        "• انجام‌شده: خودتان Done زده‌اید\n"
+        "• نادیده: Ignore کرده‌اید\n"
+        "• مشکوک: پرچم قرمز / اسکم"
+    ),
+    "risk": (
+        "برچسب ریسک\n\n"
+        "نشان می‌دهد ربات چقدر پروژه را خطرناک دیده.\n"
+        "اگر پرچم قرمز دارد، اول لینک را خودتان چک کنید."
+    ),
+    "decision": (
+        "راهنمای تصمیم سریع\n\n"
+        "۱) نمره زیر ۵۵ → فعلاً رد\n"
+        "۲) «همه روش‌ها» و شما تراکنش نمی‌زنید → رد\n"
+        "۳) وضعیت مشکوک → رد\n"
+        "۴) نمره ۵۵–۷۰ + بدون/کم‌تراکنش → بررسی دستی لینک\n"
+        "۵) نمره بالای ۷۰ + بدون تراکنش → اولویت بالاتر\n\n"
+        "ربات Claim نمی‌کند؛ تصمیم نهایی با شماست."
+    ),
+    "min_score": (
+        "حداقل نمره نمایش\n\n"
+        "پیش‌فرض ۵۵ است تا لیست شلوغ نشود.\n"
+        "اگر چیزی ندیدید، کمی عدد را پایین بیاورید."
+    ),
+    "chain": (
+        "شبکه (چین)\n\n"
+        "فقط شبکه‌هایی را نگه دارید که والت‌تان روی آن‌ها کار می‌کند."
+    ),
+}
+
+STATUS_FA = {
+    "new": "جدید",
+    "notified": "اطلاع‌داده",
+    "done": "انجام‌شده",
+    "ignored": "نادیده",
+    "scam": "مشکوک",
+}
+STATUS_EN = {v: k for k, v in STATUS_FA.items()}
+
+STRATEGY_FA = {
+    "zero_tx": "بدون تراکنش",
+    "low_tx": "کم‌تراکنش",
+    "medium_tx": "عادی",
+    "high_tx": "همه روش‌ها",
+}
+
+
+def is_likely_article(name: str, url: str = "") -> bool:
+    """خبر/مقاله/آموزش را از ایردراپ واقعی جدا می‌کند."""
+    n = (name or "").strip().lower()
+    u = (url or "").strip().lower()
+    if not n:
+        return True
+    # الگوهای عنوان مقاله/خبر
+    article_phrases = [
+        "how to ", "what is ", "what are ", "explained", "guide",
+        "tutorial", "beginner", "for the first time", "busy week",
+        "another week", "deadlines and", "series,", " netflix ",
+        "rewards explained", "holders get paid", "airdrop meta",
+        "spot the next", "news:", "weekly", "recap", "opinion:",
+        "review:", " vs ", "compared", "everything you need",
+        "top 10", "top 5", "best airdrops in", "list of airdrops",
+    ]
+    if any(p in n for p in article_phrases):
+        return True
+    # علامت سوال در عنوان آموزشی
+    if n.endswith("?") or "؟" in n:
+        return True
+    # دامنه‌های خبری رایج در لینک
+    news_hosts = [
+        "coindesk.com", "cointelegraph.com", "decrypt.co",
+        "theblock.co", "bitcoin.com/news", "news.",
+        "medium.com", "substack.com", "mirror.xyz",
+    ]
+    if any(h in u for h in news_hosts):
+        # اگر فقط خبر است نه صفحه پروژه
+        if not any(x in u for x in ["airdrop", "claim", "quest", "points"]):
+            return True
+    return False
+
+
+
+def explain_airdrop(row) -> str:
+    """توضیح کوتاه و اختصاصی: قوت / ضعف / جمع‌بندی بر اساس همان نمره و فاکتورها."""
+    name = str(row.get("name") or "این پروژه")
+    try:
+        score = float(row.get("legitimacy_score") or 0)
+    except Exception:
+        score = 0.0
+    risk = str(row.get("risk_label") or "")
+    level = str(row.get("participation_level") or "")
+    status = str(row.get("status") or "")
+    chain = row.get("chain")
+    link = row.get("project_url") or row.get("airdrop_url") or ""
+
+    strengths = []
+    weaknesses = []
+
+    # --- از reasons ---
+    reasons = row.get("reasons")
+    if isinstance(reasons, str):
+        try:
+            reasons = json.loads(reasons)
+        except Exception:
+            reasons = [reasons]
+    if not isinstance(reasons, (list, tuple)):
+        reasons = []
+
+    for r in reasons:
+        s = str(r)
+        sl = s.lower()
+        # استخراج عدد امتیاز اگر بود
+        bonus = ""
+        if "(+" in s:
+            try:
+                bonus = s[s.index("(+") : s.index(")") + 1]
+            except Exception:
+                bonus = ""
+        if "domain age" in sl or "دامنه" in s:
+            strengths.append(f"دامنه قدیمی‌تر است {bonus}".strip())
+        elif "ssl" in sl:
+            strengths.append(f"گواهی امنیتی سایت OK {bonus}".strip())
+        elif "trending" in sl or "coingecko" in sl:
+            strengths.append(f"در منابع عمومی دیده/ترند شده {bonus}".strip())
+        elif "zero_tx" in sl or "zero-tx" in sl or "social" in sl:
+            strengths.append("مشارکت بدون تراکنش در نظر گرفته شده")
+        elif "low_tx" in sl:
+            strengths.append("مشارکت کم‌هزینه/کم‌تراکنش")
+        elif "single source" in sl:
+            weaknesses.append("فقط از یک منبع آمده؛ اطلاعات کم است")
+        elif "multi" in sl and "source" in sl:
+            strengths.append("از چند منبع آمده")
+        elif "honeypot" in sl:
+            weaknesses.append("احتمال هانی‌پات یا قرارداد خطرناک")
+        elif "unverified" in sl:
+            weaknesses.append("قرارداد تأییدنشده")
+        elif "owner" in sl and ("mint" in sl or "blacklist" in sl or "pause" in sl):
+            weaknesses.append("دسترسی مشکوک مالک قرارداد")
+        elif "tvl" in sl or "liquidity" in sl:
+            strengths.append(f"نقدینگی/TVL مثبت {bonus}".strip())
+        elif "+" in s and "participation" not in sl:
+            # امتیاز مثبت عمومی
+            short = s.replace("→", " ").strip()
+            if len(short) < 90:
+                strengths.append(short)
+        elif "-" in s or "flag" in sl or "risk" in sl:
+            if len(s) < 90:
+                weaknesses.append(s)
+
+    # --- red flags ---
+    flags = row.get("red_flags")
+    if isinstance(flags, str):
+        try:
+            flags = json.loads(flags)
+        except Exception:
+            flags = [flags]
+    if isinstance(flags, (list, tuple)):
+        for f in flags:
+            weaknesses.append(f"هشدار: {f}")
+
+    # --- سطح مشارکت ---
+    if level == "zero_tx":
+        strengths.append("برای دریافت ظاهراً نیاز به سواپ/بریج سنگین نیست")
+    elif level == "low_tx":
+        strengths.append("هزینه مشارکت احتمالاً پایین است")
+    elif level == "medium_tx":
+        weaknesses.append("ممکن است کار متوسط یا سواپ بخواهد")
+    elif level == "high_tx":
+        weaknesses.append("احتمال بریج، نقدینگی یا هزینه بیشتر")
+
+    # --- ریسک ---
+    rl = risk.lower()
+    if "scam" in rl or status == "scam":
+        weaknesses.append("برچسب مشکوک/اسکم")
+    elif rl == "risky" or "high" in rl:
+        weaknesses.append(f"ریسک ثبت‌شده: {risk}")
+    elif "low" in rl or "safe" in rl:
+        strengths.append(f"ریسک پایین‌تر: {risk}")
+    elif risk:
+        weaknesses.append(f"ریسک: {risk}")
+
+    # --- لینک ---
+    if not link:
+        weaknesses.append("لینک مستقیم Claim ثبت نشده")
+    elif "coingecko.com" in str(link).lower():
+        weaknesses.append("لینک صفحه معرفی است، نه لزوماً صفحه دریافت")
+    elif "twitter.com" in str(link).lower() or "x.com" in str(link).lower():
+        weaknesses.append("فقط لینک شبکه اجتماعی دارد")
+
+    if not chain or str(chain) in ("None", "nan", ""):
+        weaknesses.append("شبکه مشخص نیست")
+
+    # یکتا کردن و محدود کردن
+    def uniq(items, n=6):
+        seen = set()
+        out = []
+        for x in items:
+            x = str(x).strip()
+            if not x or x in seen:
+                continue
+            seen.add(x)
+            out.append(x)
+            if len(out) >= n:
+                break
+        return out
+
+    strengths = uniq(strengths)
+    weaknesses = uniq(weaknesses)
+
+    # --- جمع‌بندی بر اساس نمره + سطح ---
+    if status == "scam" or any("اسکم" in w or "هانی" in w for w in weaknesses):
+        verdict = "جمع‌بندی: رد — ریسک جدی دیده می‌شود."
+    elif level == "high_tx" and score < 70:
+        verdict = "جمع‌بندی: اگر تراکنش نمی‌زنید، رد کنید."
+    elif score >= 75 and level in ("zero_tx", "low_tx") and not weaknesses:
+        verdict = "جمع‌بندی: اولویت خوب برای بررسی دستی."
+    elif score >= 70 and level in ("zero_tx", "low_tx"):
+        verdict = "جمع‌بندی: ارزش بررسی دارد؛ اول لینک رسمی را چک کنید."
+    elif score >= 55 and level in ("zero_tx", "low_tx"):
+        verdict = "جمع‌بندی: متوسط رو به قابل‌بررسی — عجله نکنید."
+    elif score >= 55:
+        verdict = "جمع‌بندی: نمره مرزی است؛ فقط اگر نوع مشارکت‌تان جور است جلو بروید."
+    else:
+        verdict = "جمع‌بندی: اولویت پایین."
+
+    lines = [f"**{name} — نمره {score:.0f}**", ""]
+    if strengths:
+        lines.append("**نقاط قوت**")
+        for s in strengths:
+            lines.append(f"• {s}")
+        lines.append("")
+    if weaknesses:
+        lines.append("**نقاط ضعف**")
+        for w in weaknesses:
+            lines.append(f"• {w}")
+        lines.append("")
+    if not strengths and not weaknesses:
+        lines.append("فاکتور خاصی ثبت نشده؛ فقط به نمره کل اتکا شده.")
+        lines.append("")
+    lines.append(verdict)
+    return "\n".join(lines)
+
+
+
+def get_database_url() -> str:
+    try:
+        url = st.secrets["DATABASE_URL"]
+        if url:
+            return str(url).strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return os.getenv("DATABASE_URL", "").strip().strip('"').strip("'")
+
+
+db_url = get_database_url()
+if not db_url:
+    st.error("آدرس دیتابیس تنظیم نشده.")
+    st.caption("Manage app → Settings → Secrets → DATABASE_URL")
+    st.stop()
+
+clean_url = (
+    db_url.replace("&channel_binding=require", "")
+    .replace("channel_binding=require&", "")
+    .replace("?channel_binding=require", "")
+)
+
+try:
+    engine = create_engine(
+        clean_url,
+        pool_pre_ping=True,
+        connect_args={"connect_timeout": 15},
+    )
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+except Exception as e:
+    st.error("اتصال به دیتابیس برقرار نشد.")
+    st.code(str(e))
+    st.stop()
+
+
+@st.cache_data(ttl=60)
+def load_airdrops(_url: str) -> pd.DataFrame:
+    u = (
+        _url.replace("&channel_binding=require", "")
+        .replace("channel_binding=require&", "")
+        .replace("?channel_binding=require", "")
+    )
+    eng = create_engine(u, pool_pre_ping=True, connect_args={"connect_timeout": 15})
+    q = text(
+        """
+        SELECT id, name, description, project_url, airdrop_url, chain,
+               legitimacy_score, score_breakdown, reasons, risk_label, red_flags,
+               participation_level, participation_tags, sources, source_links,
+               status, first_seen, last_updated, last_scanned
+        FROM airdrops
+        ORDER BY legitimacy_score DESC NULLS LAST, last_updated DESC
+        """
+    )
+    with eng.connect() as conn:
+        return pd.read_sql(q, conn)
+
+
+@st.cache_data(ttl=60)
+def load_logs(_url: str) -> pd.DataFrame:
+    u = (
+        _url.replace("&channel_binding=require", "")
+        .replace("channel_binding=require&", "")
+        .replace("?channel_binding=require", "")
+    )
+    eng = create_engine(u, pool_pre_ping=True, connect_args={"connect_timeout": 15})
+    q = text(
+        """
+        SELECT id, started_at, finished_at, airdrops_found, airdrops_new,
+               airdrops_updated, status, errors
+        FROM scan_logs ORDER BY id DESC LIMIT 15
+        """
+    )
+    try:
+        with eng.connect() as conn:
+            return pd.read_sql(q, conn)
+    except Exception:
+        return pd.DataFrame()
+
+
+# سایدبار
+st.sidebar.markdown("### فیلترها")
+with st.sidebar.popover("راهنمای تصمیم"):
+    st.markdown(HELP["decision"])
+with st.sidebar.popover("نمره چیست؟"):
+    st.markdown(HELP["score"])
+
+min_score = st.sidebar.slider("حداقل نمره", 0, 100, 55)
+with st.sidebar.popover("درباره حداقل نمره"):
+    st.markdown(HELP["min_score"])
+
+st.sidebar.markdown("#### نوع مشارکت")
+with st.sidebar.popover("توضیح نوع مشارکت"):
+    st.markdown(HELP["strategy"])
+
+selected_levels = []
+for key, label in STRATEGY_FA.items():
+    default_on = key in ("zero_tx", "low_tx")
+    if st.sidebar.checkbox(label, value=default_on, key=f"lvl_{key}"):
+        selected_levels.append(key)
+
+st.sidebar.markdown("#### وضعیت")
+with st.sidebar.popover("توضیح وضعیت"):
+    st.markdown(HELP["status"])
+
+selected_status_fa = st.sidebar.multiselect(
+    "وضعیت‌های نمایش",
+    options=list(STATUS_FA.values()),
+    default=[STATUS_FA["new"], STATUS_FA["notified"]],
+)
+selected_status = [STATUS_EN[x] for x in selected_status_fa if x in STATUS_EN]
+
+if st.sidebar.button("به‌روزرسانی داده"):
+    load_airdrops.clear()
+    load_logs.clear()
+    st.rerun()
+
+try:
+    df = load_airdrops(db_url)
+except Exception as e:
+    st.error("خواندن ایردراپ‌ها خطا داد.")
+    st.code(str(e))
+    st.stop()
+
+logs = load_logs(db_url)
+
+only_real = st.sidebar.checkbox(
+    "فقط ایردراپ واقعی (حذف خبر و مقاله)",
+    value=True,
+    key="only_real_airdrop",
+)
+
+view = df.copy() if df is not None else pd.DataFrame()
+if not view.empty:
+    if only_real:
+        def _row_is_article(r):
+            link = str(r.get("project_url") or r.get("airdrop_url") or "")
+            return is_likely_article(str(r.get("name") or ""), link)
+        view = view[~view.apply(_row_is_article, axis=1)]
+    if selected_levels and "participation_level" in view.columns:
+        view = view[view["participation_level"].isin(selected_levels)]
+    if "legitimacy_score" in view.columns:
+        view = view[view["legitimacy_score"].fillna(0) >= min_score]
+    if selected_status and "status" in view.columns:
+        view = view[view["status"].isin(selected_status)]
+
+    chains = sorted([c for c in view["chain"].dropna().unique().tolist() if c])
+    if chains:
+        with st.sidebar.popover("توضیح شبکه"):
+            st.markdown(HELP["chain"])
+        pick = st.sidebar.multiselect("شبکه", options=chains, default=chains)
+        if pick:
+            view = view[view["chain"].isin(pick) | view["chain"].isna()]
+
+st.title("شکارچی ایردراپ")
+st.caption("فقط مشاهده و فیلتر — دریافت همیشه دستی است")
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("کل در دیتابیس", len(df) if df is not None else 0)
+c2.metric("نمایش بعد از فیلتر", len(view))
+c3.metric(
+    "آخرین اسکن",
+    str(logs.iloc[0]["status"]) if logs is not None and not logs.empty else "—",
+)
+c4.metric(
+    "زمان اسکن",
+    str(logs.iloc[0]["finished_at"])[:16]
+    if logs is not None and not logs.empty and pd.notna(logs.iloc[0].get("finished_at"))
+    else "—",
+)
+
+tab1, tab2, tab3 = st.tabs(["لیست ایردراپ", "نمودار", "وضعیت ربات"])
+
+with tab1:
+    with st.popover("راهنمای این صفحه"):
+        st.markdown(
+            "کنار هر نام، علامت **؟** را بزنید تا توضیح تصمیم‌گیری همان ایردراپ باز شود."
+        )
+    with st.popover("ریسک یعنی چه؟"):
+        st.markdown(HELP["risk"])
+
+    if view.empty:
+        st.warning(
+            "با فیلتر فعلی چیزی نیست. حداقل نمره را کم کنید یا نوع مشارکت بیشتری انتخاب کنید."
+        )
+    else:
+        show = view.copy()
+        if "status" in show.columns:
+            show["وضعیت"] = show["status"].map(lambda x: STATUS_FA.get(x, x))
+        if "participation_level" in show.columns:
+            show["مشارکت"] = show["participation_level"].map(
+                lambda x: STRATEGY_FA.get(x, x)
+            )
+        cols = [
+            c
+            for c in [
+                "name",
+                "legitimacy_score",
+                "risk_label",
+                "مشارکت",
+                "chain",
+                "وضعیت",
+                "project_url",
+                "airdrop_url",
+            ]
+            if c in show.columns
+        ]
+        rename = {
+            "name": "نام",
+            "legitimacy_score": "نمره",
+            "risk_label": "ریسک",
+            "chain": "شبکه",
+            "project_url": "لینک پروژه",
+            "airdrop_url": "لینک ایردراپ",
+        }
+        st.dataframe(
+            show[cols].rename(columns=rename),
+            use_container_width=True,
+            height=320,
+        )
+
+        st.markdown("#### جزئیات + توضیح تصمیم")
+        for i, (_, row) in enumerate(view.head(15).iterrows()):
+            score = float(row.get("legitimacy_score") or 0)
+            name = str(row.get("name") or "?")
+            col_a, col_b = st.columns([0.92, 0.08])
+            with col_a:
+                with st.expander(f"{name} — نمره {score:.0f}", expanded=False):
+                    st.write("**ریسک:**", row.get("risk_label"))
+                    st.write(
+                        "**مشارکت:**",
+                        STRATEGY_FA.get(
+                            row.get("participation_level"),
+                            row.get("participation_level"),
+                        ),
+                    )
+                    st.write(
+                        "**وضعیت:**",
+                        STATUS_FA.get(row.get("status"), row.get("status")),
+                    )
+                    st.write("**شبکه:**", row.get("chain") or "—")
+                    link = row.get("project_url") or row.get("airdrop_url")
+                    if link:
+                        st.write("**لینک:**", link)
+                    reasons = row.get("reasons")
+                    if isinstance(reasons, str):
+                        try:
+                            reasons = json.loads(reasons)
+                        except Exception:
+                            reasons = [reasons]
+                    if reasons is not None and not isinstance(reasons, float):
+                        st.write("**چرا این نمره؟**")
+                        for r in list(reasons)[:6]:
+                            st.write("-", r)
+                    flags = row.get("red_flags")
+                    if isinstance(flags, str):
+                        try:
+                            flags = json.loads(flags)
+                        except Exception:
+                            flags = [flags]
+                    if flags is not None and not isinstance(flags, float) and list(flags):
+                        st.error(
+                            "پرچم قرمز: " + "، ".join(str(f) for f in list(flags)[:5])
+                        )
+            with col_b:
+                with st.popover("؟"):
+                    st.markdown(explain_airdrop(row))
+
+with tab2:
+    if view.empty:
+        st.info("برای نمودار، فیلتر را بازتر کنید.")
+    else:
+        st.plotly_chart(
+            px.histogram(view, x="legitimacy_score", nbins=15, title="پراکندگی نمره"),
+            use_container_width=True,
+        )
+        if "risk_label" in view.columns:
+            counts = view["risk_label"].value_counts().reset_index()
+            counts.columns = ["risk_label", "count"]
+            st.plotly_chart(
+                px.pie(
+                    counts, names="risk_label", values="count", title="سهم برچسب ریسک"
+                ),
+                use_container_width=True,
+            )
+
+with tab3:
+    st.caption("ربات روی Render کار می‌کند؛ این صفحه فقط گزارش می‌خواند.")
+    if logs is None or logs.empty:
+        st.info("هنوز لاگ اسکنی نیست.")
+    else:
+        st.dataframe(logs, use_container_width=True)
+
+st.markdown("---")
+st.caption(
+    f"آخرین بارگذاری: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC — Claim همیشه دستی"
+)
